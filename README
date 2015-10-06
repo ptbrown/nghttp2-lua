@@ -1,0 +1,4 @@
+HTTP2 module for Lua
+
+Uses the library from https://nghttp2.org/
+

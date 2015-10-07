@@ -93,7 +93,7 @@ end
 -- Unknown keys are ignored. Values that are not numbers will
 -- cause the function to return `nil` so the caller can fail
 -- gracefully.
-local function create_settings_array(settings)
+local function create_settings(settings)
     local converted = {}
     local niv = 0
     for name, value in pairs(settings) do
@@ -126,7 +126,7 @@ end
 --  @param  settings The settings table.
 --  @return Packed string.
 function nghttp2.pack_settings_payload(settings)
-    local iv, niv = create_settings_array(settings)
+    local iv, niv = create_settings(settings)
     if not iv then
         return nil, "Invalid values in settings table"
     end
@@ -137,6 +137,50 @@ function nghttp2.pack_settings_payload(settings)
         return nil, ffi.string(lib.nghttp2_strerror(buflen)), buflen
     end
     return ffi.string(buf, buflen)
+end
+
+local session_registry = setmetatable({}, { __mode = "kv" })
+local data_source_registry = setmetatable({}, { __mode = "k" })
+
+local function session_ref(session)
+    session_registry[session._ptr] = session
+    data_source_registry[session] = {}
+end
+
+local function session_unref(session)
+    session_registry[session._ptr] = nil
+    data_source_registry[session] = nil
+end
+
+local function data_source_ref(session, source)
+    if not data_source_registry[session] then
+        data_source_registry[session] = {}
+    end
+    local reg = data_source_registry[session]
+    local ref = #reg + 1
+    reg[ref] = source
+    return ref
+end
+
+local function data_source_read(session, stream_id, buf, length, data_flags, source, user_data)
+    session = session_registry[session]
+    if not session then
+        return lib.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
+    end
+    source = data_source_registry[session][source.fd]
+    if not source then
+        return lib.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
+    end
+    local data, flags, error_code = source(session, stream_id, length)
+    ffi.copy(buf, data, #data)
+    return #data
+end
+
+local function create_data_provider(session, source)
+    local data_prd = ffi.new("nghttp2_data_provider[1]", { source_t })
+    data_prd[0].source.fd = data_source_ref(session,source)
+    data_prd[0].read_callback = cb_data_source_read
+    return data_prd
 end
 
 -- Make a C callbacks structure using the functions in a table.
@@ -245,6 +289,63 @@ local function create_callbacks(opts)
     return cb
 end
 
+local function create_http2_flags(opts)
+    local flags = 0
+    if opts then
+        for _,opt in ipairs(opts) do
+            if type(opt) == 'number' then
+                flags = flags + opt
+            else
+                opt = "NGHTTP2_FLAG_" + string.upper(opt)
+                if lib[opt] then
+                    flags = flags + header_flags[opt]
+                end
+            end
+        end
+    end
+    return flags
+end
+
+local function create_header_flags(opt, ...)
+    local flags = 0
+    if opt then
+        if type(opt) == 'number' then
+            flags = flags + opt
+        else
+            opt = "NGHTTP2_NV_FLAG_" + string.upper(opt)
+            if lib[opt] then
+                flags = flags + header_flags[opt]
+            end
+        end
+    end
+    return flags + create_header_flags(...)
+end
+
+local function create_header_def(nv, name, value, ...)
+    if type(name) ~= 'string' or type(value) ~= 'string' then
+        return false
+    end
+    nv.name = name
+    nv.namelen = #name
+    nv.value = value
+    nv.valualen = #value
+    nv.flags = create_header_flags(...)
+    return true
+end
+
+-- Headers are an array of {name,value,flags...}
+-- The only defined flag so far is "sensitive"
+local function create_headers(headers)
+    local nvlen = #headers
+    local nva = ffi.new("nghttp2_nv[?]", nvlen)
+    for n = 1,nvlen do
+        if not create_header_def(nva[n-1], unpack(headers[n])) then
+            return nil
+        end
+    end
+    return nva, nvlen
+end
+
 -- Makes a C options structure from table keys.
 local function create_options(options)
     local opt = ffi.new"nghttp2_option*[1]"
@@ -288,9 +389,31 @@ local function create_options(options)
     return opt
 end
 
+-- Make a C priority structure from a number or table.
+local function create_priority(priority)
+    local pri_spec = ffi.new"nghttp2_priority[1]"
+    if type(priority) == 'number' then
+        pri_spec[0].stream_id = priority
+        pri_spec[0].weight = lib.NGHTTP2_DEFAULT_WEIGHT
+    else
+        if not priority[1] then
+            return nil
+        end
+        pri_spec[0].stream_id = priority[1]
+        local weight = tonumber(priority[2])
+        if weight then
+            pri_spec[0].weight = weight
+        end
+        if priority[3] then
+            pri_spec[0].exclusive = 1
+        end
+    end
+    return pri_spec
+end
+
 --- Create a client session.
 --  @return Session object.
-function nghttp2.session.client_new(options)
+function nghttp2.session.client(options)
     local error_code, ope, cb
     opt, error_code = create_options(options)
     if not opt then
@@ -310,7 +433,7 @@ end
 
 --- Create a server session.
 --  @return Session object.
-function nghttp2.session.server_new(options)
+function nghttp2.session.server(options)
     local error_code, ope, cb
     opt, error_code = create_options(options)
     if not opt then
@@ -512,29 +635,63 @@ function nghttp2.session:get_remote_settings(id)
     if not id then
         return nil, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
     end
-    local value = lib.nghttp2_session_get_remote_settings(id)
+    local value = lib.nghttp2_session_get_remote_settings(self._ptr, id)
     return error_result(value)
 end
 
+--- Change the next stream ID number.
+--  @param stream_id    Number of the next stream.
+--  @return True if the function succeeds.
 function nghttp2.session:set_next_stream_id(stream_id)
+    local error_code = lib.nghttp2_session_set_next_stream_id(self._ptr, stream_id)
+    return error_success(error_code)
 end
 
+--- Return the next outgoing stream ID.
+--  @return The stream ID number or `nil` if there are no more IDs.
 function nghttp2.session:get_next_stream_id()
+    local stream_id = lib.nghttp2_session_get_next_stream_id(self._ptr)
+    if stream_id == 0x80000000 then
+        return nil
+    end
+    return stream_id
 end
 
+--- Return the last stream ID that has processed input.
+--  @return The stream ID number.
 function nghttp2.session:get_last_proc_stream_id()
     return lib.nghttp2_get_last_proc_stream_id(self._ptr)
 end
 
+--- Tell the session how many bytes have been processed.
+--  @param stream_id    The stream ID the bytes were read from.
+--  @param size         Number of bytes.
+--  @return True if the function succeeds.
 function nghttp2.session:consume(stream_id, size)
+    local error_code = lib.nghttp2_session_consume(self._ptr, stream_id, size)
+    return error_success(error_code)
 end
 
+--- Tell the session how many bytes have been processed at the connection level.
+--  @param size Number of bytes.
+--  @return True if the function succeeds.
 function nghttp2.session:consume_connection(size)
+    local error_code = lib.nghttp2_session_consume_connection(self._ptr, size)
+    return error_success(error_code)
 end
 
+--- Tell the session how many bytes have been processed at the stream level.
+--  @param stream_id    The stream ID the bytes were read from.
+--  @param size         Number of bytes.
+--  @return True if the function succeeds.
 function nghttp2.session:consume_stream(stream_id, size)
+    local error_code = lib.nghttp2_session_consume_stream(self._ptr, stream_id, size)
+    return error_success(error_code)
 end
 
+--- Perform a HTTP upgrade.
+--  @param settings_payload Decoded string from the HTTP2-Settings header.
+--  @return True if the function succeeds.
 function nghttp2.session:upgrade(settings_payload)
     assert(type(settings_payload) == 'string', "argument must be a string")
     local error_code = lib.nghttp2_session_upgrade(self._ptr, settings_payload, #settings_payload, nil)
@@ -543,21 +700,24 @@ end
 
 function nghttp2.session:submit_request(headers, source, priority)
     local nva,nvlen = create_headers(headers)
-    local data_prd = create_data_provider(source)
+    local data_prd = create_data_provider(self, source)
+    priority = create_priority(priority)
     local stream_id = lib.nghttp2_submit_request(self._ptr, priority, nva, nvlen, data_prd, nil)
     return error_result(stream_id)
 end
 
 function nghttp2.session:submit_response(stream_id, headers, source)
     local nva,nvlen = create_headers(headers)
-    local data_prd = create_data_provider(source)
+    local data_prd = create_data_provider(self, source)
     local error_code = lib.nghttp2_submit_response(self._ptr, stream_id, nva, nvlen, data_prd)
     return error_success(error_code)
 end
 
 function nghttp2.session:submit_headers(stream_id, headers, priority, flags)
     local nva,nvlen = create_headers(headers)
-    local error_code = lib.nghttp2_submit_headers(self._ptr, flags or 0, stream_id, priority, nva, nvlen, nil)
+    priority = create_priority(priority)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_headers(self._ptr, flags, stream_id, priority, nva, nvlen, nil)
     return error_success(error_code)
 end
 
@@ -568,46 +728,57 @@ function nghttp2.session:submit_trailer(stream_id, headers)
 end
 
 function nghttp2.session:submit_data(stream_id, source, flags)
-    local data_prd = create_data_provider(source)
-    local error_code = lib.nghttp2_submit_data(self._ptr, flags or 0, stream_id, data_prd)
+    local data_prd = create_data_provider(self, source)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_data(self._ptr, flags, stream_id, data_prd)
     return error_success(error_code)
 end
 
 function nghttp2.session:submit_priority(stream_id, priority, flags)
-    local error_code = lib.nghttp2_submit_priority(self._ptr, flags or 0, stream_id, priority)
+    priority = create_priority(priority)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_priority(self._ptr, flags, stream_id, priority)
     return error_success(error_code)
 end
 
 function nghttp2.session:submit_rst_stream(stream_id, error_code, flags)
-    local error_code = lib.nghttp2_submit_rst_stream(self._ptr, flags or 0, stream_id, error_code)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_rst_stream(self._ptr, flags, stream_id, error_code)
     return error_success(error_code)
 end
 
 function nghttp2.session:submit_settings(settings, flags)
-    local iv,niv = create_settings_array(settings)
-    local error_code = lib.nghttp2_submit_settings(self._ptr, flags or 0, iv, niv)
+    local iv,niv = create_settings(settings)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_settings(self._ptr, flags, iv, niv)
     return error_success(error_code)
 end
 
 function nghttp2.session:submit_push_promise(stream_id, headers, flags)
     local nva,nvlen = create_headers(headers)
-    stream_id = lib.nghttp2_submit_headers(self._ptr, flags or 0, stream_id, nva, nvlen, nil)
+    flags = create_http2_flags(flags)
+    stream_id = lib.nghttp2_submit_headers(self._ptr, flags, stream_id, nva, nvlen, nil)
     return error_result(stream_id)
 end
 
 function nghttp2.session:submit_ping(data, flags)
     data = data or ""
-    assert(type(data) == 'string', "argument must be a string")
+    if type(data) ~= 'string' then
+        return false, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
+    end
     local opaque_data = ffi.new("uint8_t[8]")
     ffi.copy(opaque_data, data, math.min(8,#data))
-    local error_code = lib.nghttp2_submit_ping(self._ptr, flags or 0, opaque_data)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_ping(self._ptr, flags, opaque_data)
     return error_success(error_code)
 end
 
 function nghttp2.session:submit_goaway(error_code, last_stream_id, flags, data)
     local datalen = 0
     if data ~= nil then
-        assert(type(data) == 'string', "argument must be a string")
+        if type(data) ~= 'string' then
+            return false, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
+        end
         datalen = #data
     end
     error_code = lib.nghttp2_submit_goaway(self._ptr, flags or 0, last_stream_id, error_code, data, datalen)
@@ -615,7 +786,8 @@ function nghttp2.session:submit_goaway(error_code, last_stream_id, flags, data)
 end
 
 function nghttp2.session:submit_window_update(stream_id, size_increment, flags)
-    local error_code = lib.nghttp2_submit_window_update(self._ptr, flags or 0, stream_id, size_increment)
+    flags = create_http2_flags(flags)
+    local error_code = lib.nghttp2_submit_window_update(self._ptr, flags, stream_id, size_increment)
     return error_success(error_code)
 end
 
@@ -634,8 +806,6 @@ function nghttp2.session:find_stream(stream_id)
     end
     return stream
 end
-
-nghttp2.stream = {}
 
 function nghttp2.stream:stream_id()
     return lib.nghttp2_stream_get_stream_id(self._ptr)

@@ -242,7 +242,7 @@ local function create_callbacks(opts)
         end
         lib.nghttp2_session_callbacks_set_send_data_callback(cb, opts.send_data)
     end
-    return cb, opts.user_data
+    return cb
 end
 
 -- Makes a C options structure from table keys.
@@ -296,12 +296,12 @@ function nghttp2.session.client_new(options)
     if not opt then
         return nil, "could not create session", error_code
     end
-    cb, user_data, error_code = create_callbacks(options)
+    cb, error_code = create_callbacks(options)
     if not cb then
         return nil, "could not create session", error_code
     end
     local session = session_ct()
-    error_code = lib.nghttp2_session_client_new2(ffi.cast("nghttp2_session**",session), cb, user_data, opt)
+    error_code = lib.nghttp2_session_client_new2(ffi.cast("nghttp2_session**",session), cb, nil, opt)
     if error_code ~= 0 then
         return nil, "could not create session", error_code
     end
@@ -316,12 +316,12 @@ function nghttp2.session.server_new(options)
     if not opt then
         return nil, "could not create session", error_code
     end
-    cb, user_data, error_code = create_callbacks(options)
+    cb, error_code = create_callbacks(options)
     if not cb then
         return nil, "could not create session", error_code
     end
     local session = session_ct
-    error_code = lib.nghttp2_session_server_new2(ffi.cast("nghttp2_session**",session), cb, user_data, opt)
+    error_code = lib.nghttp2_session_server_new2(ffi.cast("nghttp2_session**",session), cb, opt)
     if error_code ~= 0 then
         return nil, "could not create session", error_code
     end
@@ -341,41 +341,63 @@ end
 --  Calls the `send` callback with the data that will be sent.
 --  @return True if the data was sent.
 function nghttp2.session:send()
+    local error_code = lib.nghttp2_session_send(self._ptr)
+    return error_success(error_code)
 end
 
 --- Get any pending outgoing data.
 --  Returns the data to be sent instead of calling the `send` callback.
 --  @return A block of data as a string.
 function nghttp2.session:mem_send()
+    local data = ffi.new"utf8_t*[1]"
+    local length = lib.nghttp2_session_mem_send(self._ptr, data)
+    if length < 0 then
+        return nil, ffi.string(lib.nghttp2_strerror(length)), tonumber(length)
+    end
+    return ffi.string(data, length)
 end
 
 --- Fetch incoming data.
 --  Calls the `recv` callback until all pending data is received.
 --  @return True if the data was received.
 function nghttp2.session:recv()
+    local error_code = lib.nghttp2_session_recv(self._ptr)
+    return error_success(error_code)
 end
 
 --- Reads incoming data.
 --  Accepts a string of input data instead of calling the `recv` callback.
 --  @return The number of bytes that were read from the string.
 function nghttp2.session:mem_recv(data)
+    local length = lib.nghttp2_session_mem_recv(self._ptr, data, #data)
+    if length < 0 then
+        return nil, ffi.string(lib.nghttp2_strerror(length)), tonumber(length)
+    end
+    return ffi.string(data, length)
 end
 
 --- Puts back previously deferred data into the outgoing stream.
 --  @return True if the function succeeds.
 function nghttp2.session:resume_data(stream_id)
+    local error_code = lib.nghttp2_session_resume_data(self._ptr, stream_id)
+    return error_success(error_code)
 end
 
 --- Check if a session is in a read state.
 --  @return True if the session is ready to receive data.
 function nghttp2.session:want_read()
+    local error_code = lib.nghttp2_session_want_read(self._ptr, stream_id)
+    return error_success(error_code)
 end
 
 --- Check if a session is in a write state.
 --  @return True if the session is ready to send data.
 function nghttp2.session:want_write()
+    local error_code = lib.nghttp2_session_want_write(self._ptr, stream_id)
+    return error_success(error_code)
 end
 
+--[[ DISABLED
 --- Get stream user data.
 --  @return A value associated with a stream.
 function nghttp2.session:get_stream_user_data(stream_id)
@@ -387,50 +409,75 @@ end
 --  @return True if the function succeeds.
 function nghttp2.session:set_stream_user_data(stream_id, value)
 end
+]]
 
 --- Get the size of the outbound queue.
 --  @return Number of frames.
 function nghttp2.session:get_outbound_queue_size()
+    local size = lib.nghttp2_session_get_outbound_queue_size(self._ptr)
+    return size
 end
 
 --- Get the effective amount of data received.
 --  @return Size of data in bytes.
 function nghttp2.session:get_effective_recv_data_length()
+    local size = lib.nghttp2_session_get_effective_recv_data_length(self._ptr)
+    return error_result(size)
 end
 
 --- Get the local window size.
 --  @return Size of window in bytes.
 function nghttp2.session:get_effective_local_window_size()
+    local size = lib.nghttp2_session_get_stream_effective_local_window_size(self._ptr)
+    return error_result(size)
 end
 
 --- Get the remote window size.
 --  @return Size of window in bytes.
 function nghttp2.session:get_remote_window_size()
+    local size = lib.nghttp2_session_get_remote_window_size(self._ptr)
+    return error_result(size)
 end
 
 --- Get the effective amount of data received by a stream.
 --  @return Size of data in bytes.
 function nghttp2.session:get_stream_effective_recv_data_length(stream_id)
+    local size = lib.nghttp2_session_get_stream_effective_recv_data_length(self._ptr, stream_id)
+    return error_result(size)
 end
 
 --- Get the local window size for a stream.
 --  @return Size of window in bytes.
 function nghttp2.session:get_stream_effective_local_window_size(stream_id)
+    local size = lib.nghttp2_session_get_stream_effective_local_window_size(self._ptr, stream_id)
+    return error_result(size)
 end
 
 --- Get the remote window size for a stream.
 --  @return Size of window in bytes.
 function nghttp2.session:get_stream_remote_window_size(stream_id)
+    local size = lib.nghttp2_session_get_stream_remote_window_size(self._ptr, stream_id)
+    return error_result(size)
 end
 
 --- Check if a stream was closed by the local peer.
 --  @return True if the stream is half closed. False is not. Nil if the stream is invalid.
 function nghttp2.session:get_stream_local_close(stream_id)
+    local is_close = lib.nghttp2_session_get_stream_local_close(self._ptr, stream_id)
+    if is_close < 0 then
+        return nil, ffi.string(lib.nghttp2_strerror(error_code)), tonumber(error_code)
+    end
+    return is_close ~= 0
 end
 
 --- Check if a stream was closed by the remote peer.
 --  @return True if the stream is half closed. False is not. Nil if the stream is invalid.
 function nghttp2.session:get_stream_remote_close(stream_id)
+    local is_close = lib.nghttp2_session_get_stream_remote_close(self._ptr, stream_id)
+    if is_close < 0 then
+        return nil, ffi.string(lib.nghttp2_strerror(error_code)), tonumber(error_code)
+    end
+    return is_close ~= 0
 end
 
 --- Close some or all of the streams in a session.
@@ -488,16 +535,16 @@ end
 function nghttp2.session:consume_stream(stream_id, size)
 end
 
-function nghttp2.session:upgrade(settings_payload, stream_user_data)
+function nghttp2.session:upgrade(settings_payload)
     assert(type(settings_payload) == 'string', "argument must be a string")
-    local error_code = lib.nghttp2_session_upgrade(self._ptr, settings_payload, #settings_payload, stream_user_data)
+    local error_code = lib.nghttp2_session_upgrade(self._ptr, settings_payload, #settings_payload, nil)
     return error_success(error_code)
 end
 
-function nghttp2.session:submit_request(headers, source, priority, user_data)
+function nghttp2.session:submit_request(headers, source, priority)
     local nva,nvlen = create_headers(headers)
     local data_prd = create_data_provider(source)
-    local stream_id = lib.nghttp2_submit_request(self._ptr, priority, nva, nvlen, data_prd, user_data)
+    local stream_id = lib.nghttp2_submit_request(self._ptr, priority, nva, nvlen, data_prd, nil)
     return error_result(stream_id)
 end
 
@@ -508,9 +555,9 @@ function nghttp2.session:submit_response(stream_id, headers, source)
     return error_success(error_code)
 end
 
-function nghttp2.session:submit_headers(stream_id, headers, priority, flags, user_data)
+function nghttp2.session:submit_headers(stream_id, headers, priority, flags)
     local nva,nvlen = create_headers(headers)
-    local error_code = lib.nghttp2_submit_headers(self._ptr, flags or 0, stream_id, priority, nva, nvlen, user_data)
+    local error_code = lib.nghttp2_submit_headers(self._ptr, flags or 0, stream_id, priority, nva, nvlen, nil)
     return error_success(error_code)
 end
 
@@ -542,9 +589,9 @@ function nghttp2.session:submit_settings(settings, flags)
     return error_success(error_code)
 end
 
-function nghttp2.session:submit_push_promise(stream_id, headers, flags, user_data)
+function nghttp2.session:submit_push_promise(stream_id, headers, flags)
     local nva,nvlen = create_headers(headers)
-    stream_id = lib.nghttp2_submit_headers(self._ptr, flags or 0, stream_id, nva, nvlen, user_data)
+    stream_id = lib.nghttp2_submit_headers(self._ptr, flags or 0, stream_id, nva, nvlen, nil)
     return error_result(stream_id)
 end
 

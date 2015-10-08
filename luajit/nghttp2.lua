@@ -443,7 +443,7 @@ function nghttp2.session.server(options)
     if not cb then
         return nil, "could not create session", error_code
     end
-    local session = session_ct
+    local session = session_ct()
     error_code = lib.nghttp2_session_server_new2(ffi.cast("nghttp2_session**",session), cb, opt)
     if error_code ~= 0 then
         return nil, "could not create session", error_code
@@ -867,33 +867,102 @@ end
 
 
 function nghttp2.hddeflate.new(max_size)
+    deflater = hddeflate_ct()
+    local error_code = lib.nghttp2_hd_deflate_new(ffi.cast("nghttp2_hd_deflater**",deflater), max_size)
+    if error_code ~= 0 then
+        return nil, ffi.string(lib.nghttp2_strerror(error_code)), tonumber(error_code)
+    end
+    return deflater
 end
 
 function nghttp2.hddeflate:del()
+    if self._ptr ~= nil then
+        lib.nghttp2_hd_deflate_del(self._ptr)
+        self._ptr = nil
+    end
 end
 
 function nghttp2.hddeflate:change_table_size(size)
+    local error_code = lib.nghttp2_hd_deflate_change_table_size(self._ptr, size)
+    return error_success(error_code)
 end
 
 function nghttp2.hddeflate:deflate_bound(headers)
+    local nva, nvlen = create_headers(headers)
+    if not nva then
+        return nil, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
+    end
+    local size = lib.nghttp2_hd_deflate_bound(self._ptr, nva, nvlen)
+    return error_result(size)
 end
 
+-- TODO nghttp2 documentation is ambiguous whether this returns a size or error code.
 function nghttp2.hddeflate:deflate(headers)
+    local nva, nvlen = create_headers(headers)
+    if not nva then
+        return nil, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
+    end
+    local buflen = lib.nghttp2_hd_deflate_bound(self._ptr, nva, nvlen)
+    if buflen < 0 then
+        return error_result(buflen)
+    end
+    local buf = ffi.new("uint8_t[?]", buflen)
+    local error_code = lib.nghttp2_hd_deflate_hd(self._ptr, buf, buflen, nva, nvlen)
+    if error_code < 0 then
+        return error_result(error_code)
+    end
 end
 
 function nghttp2.hdinflate.new()
+    inflater = hdinflate_ct()
+    local error_code = lib.nghttp2_hd_inflate_new(ffi.cast("nghttp2_hd_inflater**",inflater))
+    if error_code ~= 0 then
+        return nil, ffi.string(lib.nghttp2_strerror(error_code)), tonumber(error_code)
+    end
+    return inflater
 end
 
 function nghttp2.hdinflate:del()
+    if self._ptr ~= nil then
+        lib.nghttp2_hd_inflate_del(self._ptr)
+        self._ptr = nil
+    end
 end
 
 function nghttp2.hdinflate:change_table_size(size)
+    local error_code = lib.nghttp2_hd_deflate_change_table_size(self._ptr, size)
+    return error_success(error_code)
 end
 
-function nghttp2.hdinflate:inflate(buf)
+function nghttp2.hdinflate:inflate(buf, final)
+    local headers = {}
+    local nv = ffi.new"nghttp2_nv[1]"
+    local flags = ffi.new"int[1]"
+    final = final and 1 or 0
+    if type(buf) ~= 'string' then
+        return nil, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
+    end
+    inlen = #buf
+    inbuf = ffi.new("uint8_t*", ffi.cast("uint8_t*", buf))
+    repeat
+        local nbytes = lib.nghttp2_hd_inflate_hd(self._ptr, nv, flags, inbuf, inlen, final)
+        if nbytes < 0 then
+            return error_result(nbytes)
+        end
+        inbuf = inbuf + nbytes
+        inlen = math.max(inlen - nbytes, 0)
+        if bit.band(flags, lib.NGHTTP2_HD_INFLATE_EMIT) ~= 0 then
+            headers[#headers] = create_header_table(nv[0])
+        elseif inlen == 0 then
+            break
+        end
+    until bit.band(flags, lib.NGHTTP2_HD_INFLATE_FINAL) ~= 0
+    return headers
 end
 
 function nghttp2.hdinflate:end_headers()
+    local error_code = lib.nghttp2_hd_inflate_end_headers(self._ptr)
+    return error_success(error_code)
 end
 
 

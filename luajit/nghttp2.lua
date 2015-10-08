@@ -20,11 +20,11 @@ local function error_success(error_code)
 end
 
 -- Converts a return that may be an error
-local function error_result(result)
+local function error_result(result, convert)
     if result < 0 then
-        return nil, ffi.string(lib.nghttp2_strerror(error_code)), tonumber(error_code)
+        return nil, ffi.string(lib.nghttp2_strerror(result)), tonumber(result)
     end
-    return result
+    return convert and convert(result) or result
 end
 
 --- Get the library version information.
@@ -179,7 +179,7 @@ end
 local function create_data_provider(session, source)
     local data_prd = ffi.new("nghttp2_data_provider[1]", { source_t })
     data_prd[0].source.fd = data_source_ref(session,source)
-    data_prd[0].read_callback = cb_data_source_read
+    data_prd[0].read_callback = data_source_read
     return data_prd
 end
 
@@ -317,17 +317,18 @@ local function create_header_flags(opt, ...)
                 flags = flags + header_flags[opt]
             end
         end
+        return flags + create_header_flags(...)
     end
-    return flags + create_header_flags(...)
+    return flags
 end
 
 local function create_header_def(nv, name, value, ...)
     if type(name) ~= 'string' or type(value) ~= 'string' then
         return false
     end
-    nv.name = name
+    nv.name = ffi.cast("uint8_t*", name)
     nv.namelen = #name
-    nv.value = value
+    nv.value = ffi.cast("uint8_t*", value)
     nv.valuelen = #value
     nv.flags = create_header_flags(...)
     return true
@@ -549,49 +550,49 @@ end
 --  @return Number of frames.
 function nghttp2.session:get_outbound_queue_size()
     local size = lib.nghttp2_session_get_outbound_queue_size(self._ptr)
-    return size
+    return error_result(size, tonumber)
 end
 
 --- Get the effective amount of data received.
 --  @return Size of data in bytes.
 function nghttp2.session:get_effective_recv_data_length()
     local size = lib.nghttp2_session_get_effective_recv_data_length(self._ptr)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 --- Get the local window size.
 --  @return Size of window in bytes.
 function nghttp2.session:get_effective_local_window_size()
     local size = lib.nghttp2_session_get_stream_effective_local_window_size(self._ptr)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 --- Get the remote window size.
 --  @return Size of window in bytes.
 function nghttp2.session:get_remote_window_size()
     local size = lib.nghttp2_session_get_remote_window_size(self._ptr)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 --- Get the effective amount of data received by a stream.
 --  @return Size of data in bytes.
 function nghttp2.session:get_stream_effective_recv_data_length(stream_id)
     local size = lib.nghttp2_session_get_stream_effective_recv_data_length(self._ptr, stream_id)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 --- Get the local window size for a stream.
 --  @return Size of window in bytes.
 function nghttp2.session:get_stream_effective_local_window_size(stream_id)
     local size = lib.nghttp2_session_get_stream_effective_local_window_size(self._ptr, stream_id)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 --- Get the remote window size for a stream.
 --  @return Size of window in bytes.
 function nghttp2.session:get_stream_remote_window_size(stream_id)
     local size = lib.nghttp2_session_get_stream_remote_window_size(self._ptr, stream_id)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 --- Check if a stream was closed by the local peer.
@@ -647,7 +648,7 @@ function nghttp2.session:get_remote_settings(id)
         return nil, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
     end
     local value = lib.nghttp2_session_get_remote_settings(self._ptr, id)
-    return error_result(value)
+    return error_result(value, tonumber)
 end
 
 --- Change the next stream ID number.
@@ -869,11 +870,11 @@ function nghttp2.stream:first_child()
 end
 
 function nghttp2.stream:weight()
-    return lib.nghttp2_stream_get_weight(self._ptr)
+    return tonumber(lib.nghttp2_stream_get_weight(self._ptr))
 end
 
 function nghttp2.stream:sum_dependency_weight()
-    return lib.nghttp2_stream_get_sum_dependency_weight(self._ptr)
+    return tonumber(lib.nghttp2_stream_get_sum_dependency_weight(self._ptr))
 end
 
 
@@ -905,7 +906,7 @@ function nghttp2.hddeflate:deflate_bound(headers)
         return nil, "Invalid argument", lib.NGHTTP2_ERR_INVALID_ARGUMENT
     end
     local size = lib.nghttp2_hd_deflate_bound(self._ptr, nva, nvlen)
-    return error_result(size)
+    return error_result(size, tonumber)
 end
 
 -- TODO nghttp2 documentation is ambiguous whether this returns a size or error code.
@@ -919,10 +920,11 @@ function nghttp2.hddeflate:deflate(headers)
         return error_result(buflen)
     end
     local buf = ffi.new("uint8_t[?]", buflen)
-    local error_code = lib.nghttp2_hd_deflate_hd(self._ptr, buf, buflen, nva, nvlen)
-    if error_code < 0 then
-        return error_result(error_code)
+    buflen = lib.nghttp2_hd_deflate_hd(self._ptr, buf, buflen, nva, nvlen)
+    if buflen < 0 then
+        return error_result(buflen)
     end
+    return ffi.string(buf, buflen)
 end
 
 function nghttp2.hdinflate.new()
@@ -946,8 +948,14 @@ function nghttp2.hdinflate:change_table_size(size)
     return error_success(error_code)
 end
 
-function nghttp2.hdinflate:inflate(buf, final)
-    local headers = {}
+--- Decompress packed headers
+--  If the inflater reaches the end of a header block, it will return
+--  `true` and the caller should call `end_headers` before reusing this
+--  object.
+--  @return A table of {name,value} pairs.
+--  @return True if all headers were unpacked.
+function nghttp2.hdinflate:inflate(buf, final, headers)
+    headers = headers or {}
     local nv = ffi.new"nghttp2_nv[1]"
     local flags = ffi.new"int[1]"
     final = final and 1 or 0
@@ -959,17 +967,17 @@ function nghttp2.hdinflate:inflate(buf, final)
     repeat
         local nbytes = lib.nghttp2_hd_inflate_hd(self._ptr, nv, flags, inbuf, inlen, final)
         if nbytes < 0 then
-            return error_result(nbytes)
+            error_result(nbytes)
         end
         inbuf = inbuf + nbytes
-        inlen = math.max(inlen - nbytes, 0)
-        if bit.band(flags, lib.NGHTTP2_HD_INFLATE_EMIT) ~= 0 then
+        inlen = math.max(tonumber(inlen - nbytes), 0) -- really, LuaJIT?
+        if bit.band(tonumber(flags[0]), lib.NGHTTP2_HD_INFLATE_EMIT) ~= 0 then
             headers[#headers] = create_header_table(nv[0])
         elseif inlen == 0 then
-            break
+            return headers, false
         end
-    until bit.band(flags, lib.NGHTTP2_HD_INFLATE_FINAL) ~= 0
-    return headers
+    until bit.band(tonumber(flags[0]), lib.NGHTTP2_HD_INFLATE_FINAL) ~= 0
+    return headers, true
 end
 
 function nghttp2.hdinflate:end_headers()

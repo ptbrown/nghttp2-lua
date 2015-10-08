@@ -141,6 +141,7 @@ end
 
 local session_registry = setmetatable({}, { __mode = "kv" })
 local data_source_registry = setmetatable({}, { __mode = "k" })
+local callback_registry = setmetatable({}, { __mode = "k" })
 
 local function session_ref(session)
     session_registry[session._ptr] = session
@@ -150,6 +151,7 @@ end
 local function session_unref(session)
     session_registry[session._ptr] = nil
     data_source_registry[session] = nil
+    callback_registry[session] = nil
 end
 
 local function data_source_ref(session, source)
@@ -183,108 +185,321 @@ local function create_data_provider(session, source)
     return data_prd
 end
 
+local global_callbacks = {
+
+    send = ffi.cast("nghttp2_send_callback",
+    function(session, data, length, flags, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].send
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local nbytes, error_code = cb(session, ffi.string(data, length), flags)
+        if not nbytes then
+            return error_code and lib.NGHTTP2_ERR_CALLBACK_FAILURE
+                               or lib.NGHTTP2_ERR_WOULDBLOCK
+        else
+            return nbytes
+        end
+    end);
+
+    send_data = ffi.cast("nghttp2_send_data_callback",
+    function(session, frame, framehd, length, source, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].send_data
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        source = data_source_registry[session][source.fd]
+        if not source then
+            return lib.NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE
+        end
+        local framepad = tonumber(frame.data.padlen)
+        local framehdbytes = ffi.new("uint8_t[?]", 9 + framepad)
+        local padding = ''
+        if framepad > 0 then
+            padding = ffi.new("uint8_t[?]", framepad)
+            ffi.fill(padding, framepad, framepad-1)
+            ffi.fill(framehdbytes, 9 + framepad, framepad-1)
+            ffi.copy(framehdbytes, framehd, 9)
+        end
+        local result, error_code = cb(session, frame, framehdbytes, tonumber(length), padding, source, user_data)
+        if not result then
+            return error_code and lib.NGHTTP2_ERR_CALLBACK_FAILURE
+                               or lib.NGHTTP2_ERR_WOULDBLOCK
+        else
+            return 0
+        end
+    end);
+
+    recv = ffi.cast("nghttp2_recv_callback",
+    function(session, buf, length, flags, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].recv
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        length = tonumber(length)
+        local data, error_code = cb(session, length, flags)
+        if not data then
+            return error_code and lib.NGHTTP2_ERR_CALLBACK_FAILURE
+                               or lib.NGHTTP2_ERR_EOF
+        elseif data == '' then
+            return lib.NGHTTP2_ERR_WOULDBLOCK
+        else
+            ffi.copy(buf, data, math.min(#buf, length))
+            return math.min(#data, length)
+        end
+    end);
+
+    on_frame_recv = ffi.cast("nghttp2_recv_callback",
+    function(session, frame, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_frame_recv
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_invalid_frame_recv = ffi.cast("nghttp2_on_invalid_frame_recv_callback",
+    function(session, frame, error_code, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_invalid_frame_recv
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame, tonumber(error_code)) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_data_chunk_recv = ffi.cast("nghttp2_on_data_chunk_recv_callback",
+    function(session, flags, stream_id, data, len, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_data_chunk_recv
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, flags, stream_id, ffi.string(data, len)) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    before_frame_send = ffi.cast("nghttp2_before_frame_send_callback",
+    function(session, frame, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].before_frame_send
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_frame_send = ffi.cast("nghttp2_on_frame_send_callback",
+    function(session, frame, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_frame_send
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_frame_not_send = ffi.cast("nghttp2_on_frame_not_send_callback",
+    function(session, frame, error_code, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_frame_not_send
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_stream_close = ffi.cast("nghttp2_on_stream_close_callback",
+    function(session, stream_id, error_code, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_stream_close
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, stream_id, tonumber(error_code)) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_begin_headers = ffi.cast("nghttp2_on_begin_headers_callback",
+    function(session, frame, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_begin_headers
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    on_header = ffi.cast("nghttp2_on_header_callback",
+    function(session, frame, name, namelen, value, valuelen, flags, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_header
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, frame, ffi.string(name, namelen), ffi.string(value, valuelen), flags) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+    select_padding = ffi.cast("nghttp2_select_padding_callback",
+    function(session, frame, maxlen, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].select_padding
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local length, error_code = cb(session, frame, tonumber(maxlen))
+        if not length then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return length
+        end
+    end);
+
+    data_source_read_length = ffi.cast("nghttp2_data_source_read_length_callback",
+    function(session, frame_type, stream_id, session_window_size, stream_window_size, max_size, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].data_source_read_length
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local size, error_code = cb(session, frame_type, stream_id,
+            tonumber(session_window_size), tonumber(stream_window_size), tonumber(max_size))
+        if not size then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return length
+        end
+    end);
+
+    on_begin_frame = ffi.cast("nghttp2_on_begin_frame_callback",
+    function(session, framehd, user_data)
+        session = session_registry[session]
+        if not session then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        local cb = callback_registry[session].on_begin_frame
+        if not cb then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        end
+        if not cb(session, framehd) then
+            return lib.NGHTTP2_ERR_CALLBACK_FAILURE
+        else
+            return 0
+        end
+    end);
+
+}
+
+local function callback_ref(session, cb, name, callback)
+    if not callback_registry(session) then
+        callback_registry[session] = {}
+    end
+    callback_registry[session][name] = callback
+end
+
+local function session_callbacks_del(callbacks)
+    lib.nghttp2_session_callbacks_del(cb[0])
+end
+
 -- Make a C callbacks structure using the functions in a table.
 -- Will fail if a callback is defined but is not a function.
 -- Ignores keys that are not callbacks.
--- FIXME this is wrong, define a single set of library callbacks
--- and dispatch to the actual functions using references. FFI only
--- allows a limited number of callbacks and creating them is expensive.
-local function create_callbacks(opts)
+local function create_callbacks(session, opts)
     local cb = ffi.new"nghttp2_session_callbacks*[1]"
     local error_code = lib.nghttp2_session_callbacks_new(cb)
     if error_code ~= 0 then
         return nil, error_code
     end
-    ffi.gc(cb[0], lib.nghttp2_session_callbacks_del)
-    if opts.send then
-        if type(opts.send) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
+    ffi.gc(cb, session_callbacks_del)
+    for name, func in pairs(global_callbacks) do
+        if opts[name] then
+            if type(opts[name]) ~= 'function' then
+                return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
+            end
+            callback_ref(session, name, opts[name])
+            local set_callback = "nghttp2_session_callbacks_set_"..name.."_callback"
+            lib[set_callback](cb, func)
         end
-        lib.nghttp2_session_callbacks_set_send_callback(cb, opts.send)
-    end
-    if opts.recv then
-        if type(opts.recv) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_recv_callback(cb, opts.recv)
-    end
-    if opts.on_frame_recv then
-        if type(opts.on_frame_recv) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_frame_recv_callback(cb, opts.on_frame_recv)
-    end
-    if opts.on_invalid_frame_recv then
-        if type(opts.on_invalid_frame_recv) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(cb, opts.on_invalid_frame_recv)
-    end
-    if opts.data_chunk_recv then
-        if type(opts.data_chunk_recv) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_data_chunk_recv_callback(cb, opts.data_chunk_recv)
-    end
-    if opts.before_frame_send then
-        if type(opts.before_frame_send) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_before_frame_send_callback(cb, opts.before_frame_send)
-    end
-    if opts.on_frame_send then
-        if type(opts.on_frame_send) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_frame_send_callback(cb, opts.on_frame_send)
-    end
-    if opts.on_frame_not_send then
-        if type(opts.on_frame_not_send) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_frame_not_send_callback(cb, opts.on_frame_not_send)
-    end
-    if opts.on_stream_close then
-        if type(opts.on_stream_close) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_stream_close_callback(cb, opts.on_stream_close)
-    end
-    if opts.on_begin_headers then
-        if type(opts.on_begin_headers) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_begin_headers_callback(cb, opts.on_begin_headers)
-    end
-    if opts.on_header then
-        if type(opts.on_header) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_header_callback(cb, opts.on_header)
-    end
-    if opts.select_padding then
-        if type(opts.select_padding) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_sellect_padding_callback(cb, opts.select_padding)
-    end
-    if opts.data_source_read_length then
-        if type(opts.data_source_read_length) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_data_source_read_length_callback(cb, opts.data_source_read_length)
-    end
-    if opts.on_begin_frame then
-        if type(opts.on_begin_frame) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_on_begin_frame_callback(cb, opts.on_begin_frame)
-    end
-    if opts.send_data then
-        if type(opts.send_data) ~= 'function' then
-            return nil, lib.NGHTTP2_ERR_INVALID_ARGUMENT
-        end
-        lib.nghttp2_session_callbacks_set_send_data_callback(cb, opts.send_data)
     end
     return cb
 end
@@ -431,11 +646,11 @@ function nghttp2.session.client(options)
     if not opt then
         return nil, "could not create session", error_code
     end
-    cb, error_code = create_callbacks(options)
+    local session = session_ct()
+    cb, error_code = create_callbacks(session, options)
     if not cb then
         return nil, "could not create session", error_code
     end
-    local session = session_ct()
     error_code = lib.nghttp2_session_client_new2(ffi.cast("nghttp2_session**",session), cb, nil, opt)
     if error_code ~= 0 then
         return nil, "could not create session", error_code
@@ -451,11 +666,11 @@ function nghttp2.session.server(options)
     if not opt then
         return nil, "could not create session", error_code
     end
-    cb, error_code = create_callbacks(options)
+    local session = session_ct()
+    cb, error_code = create_callbacks(session, options)
     if not cb then
         return nil, "could not create session", error_code
     end
-    local session = session_ct()
     error_code = lib.nghttp2_session_server_new2(ffi.cast("nghttp2_session**",session), cb, opt)
     if error_code ~= 0 then
         return nil, "could not create session", error_code

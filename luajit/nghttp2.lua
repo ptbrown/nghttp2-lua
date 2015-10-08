@@ -328,9 +328,20 @@ local function create_header_def(nv, name, value, ...)
     nv.name = name
     nv.namelen = #name
     nv.value = value
-    nv.valualen = #value
+    nv.valuelen = #value
     nv.flags = create_header_flags(...)
     return true
+end
+
+local function create_header_table(nv)
+    local header = {
+        ffi.string(nv.name, nv.namelen),
+        ffi.string(nv.value, nv.valuelen)
+    }
+    if bit.band(nv.flags, lib.NGHTTP2_NV_FLAG_NO_INDEX) ~= 0 then
+        header[3] = "no_index"
+    end
+    return header
 end
 
 -- Headers are an array of {name,value,flags...}
@@ -867,6 +878,7 @@ end
 
 
 function nghttp2.hddeflate.new(max_size)
+    max_size = max_size or lib.NGHTTP2_DEFAULT_HEADER_TABLE_SIZE
     deflater = hddeflate_ct()
     local error_code = lib.nghttp2_hd_deflate_new(ffi.cast("nghttp2_hd_deflater**",deflater), max_size)
     if error_code ~= 0 then
@@ -984,21 +996,21 @@ ffi.cdef[[
     } nghttp2_hd_inflater_ct;
 ]]
 
-local session_ct = ffi.metatype("nghttp2_session_ct", {
+session_ct = ffi.metatype("nghttp2_session_ct", {
     __gc = nghttp2.session.del,
     __index = nghttp2.session
 })
 
-local stream_ct = ffi.metatype("nghttp2_stream_ct", {
+stream_ct = ffi.metatype("nghttp2_stream_ct", {
     __index = nghttp2.stream
 })
 
-local hddeflate_ct = ffi.metatype("nghttp2_hd_deflater_ct", {
+hddeflate_ct = ffi.metatype("nghttp2_hd_deflater_ct", {
     __gc = nghttp2.hddeflate.del,
     __index = nghttp2.hddeflate
 })
 
-local hdinflate_ct = ffi.metatype("nghttp2_hd_inflater_ct", {
+hdinflate_ct = ffi.metatype("nghttp2_hd_inflater_ct", {
     __gc = nghttp2.hdinflate.del,
     __index = nghttp2.hdinflate
 })

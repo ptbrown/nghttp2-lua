@@ -972,7 +972,7 @@ function nghttp2.hdinflate:inflate(buf, final, headers)
         inbuf = inbuf + nbytes
         inlen = math.max(tonumber(inlen - nbytes), 0) -- really, LuaJIT?
         if bit.band(tonumber(flags[0]), lib.NGHTTP2_HD_INFLATE_EMIT) ~= 0 then
-            headers[#headers] = create_header_table(nv[0])
+            headers[#headers+1] = create_header_table(nv[0])
         elseif inlen == 0 then
             return headers, false
         end
